@@ -1,0 +1,16 @@
+# Секреты и рабочие артефакты — не коммитить
+.env
+.pw_profile/
+__pycache__/
+*.pyc
+
+# Чекпоинты, отчёты и логи
+progress.json
+plan.json
+verify.txt
+jweb_snapshot.json
+run.log
+modals.log
+
+# Артефакты разведки (снимки DOM/сеть/скриншоты)
+grades_discovery/

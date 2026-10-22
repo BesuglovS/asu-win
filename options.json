@@ -1,0 +1,44 @@
+{
+  "dry_run": true,
+  "org": "Наянов",
+  "jweb_source": "auto",
+  "jweb_url": "https://j.nayanovaacademy.ru",
+  "snapshot_path": "jweb_snapshot.json",
+  "db_path": "",
+  "only_classes": [],
+  "only_subjects": [],
+  "months": [],
+  "limit": 0,
+  "force": false,
+  "cleanup_duplicates": true,
+  "pause": 0.6,
+  "date_tolerance_days": 3,
+  "assign_themes": true,
+  "assign_homework": true,
+  "overwrite_homework": false,
+  "homework_default": "Повторение изученного материала",
+  "assign_from": "",
+  "assign_to": "",
+  "create_missing_assignments": true,
+  "subject_aliases": {
+    "Инженерия беспилотных авиационных систем": "Информатика",
+    "Моделирование и пилотирование беспилотных авиационных систем": "Информатика"
+  },
+  "class_grade_subject": {
+    "7": "Информатика",
+    "8": "Информатика",
+    "9": "Информатика"
+  },
+  "preserve_classes": ["7В", "7В1", "7В2", "7Г", "7Г1", "7Г2"],
+  "homework_fallback_type": "Ответ на уроке",
+  "work_type_map": {
+    "lesson": "Ответ на уроке",
+    "answer": "Ответ на уроке",
+    "control": "Контрольная работа",
+    "homework": "Домашнее задание",
+    "ДЗ": "Домашнее задание",
+    "СР": "Самостоятельная работа",
+    "Урок": "Ответ на уроке",
+    "Сам/р": "Самостоятельная работа"
+  }
+}
