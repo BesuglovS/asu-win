@@ -8,6 +8,8 @@ __pycache__/
 progress.json
 plan.json
 verify.txt
+final_report.json
+final_cleanup.json
 jweb_snapshot.json
 run.log
 modals.log

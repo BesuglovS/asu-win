@@ -23,6 +23,11 @@ students/classes. Приёмник: электронный классный жу
   python grades_upload.py run       — залить оценки (по options.json)
   python grades_upload.py verify    — сверить оценки на сайте с БД j-web
   python grades_upload.py assign    — темы уроков (из КТП) и ДЗ (из j-web)
+  python grades_upload.py final     — итоговые за период по средней оценке
+                                      (Журнал → Итоговые отметки; порог 0.6)
+  python grades_upload.py final_cleanup — убрать итоговые за период в ЧУЖИХ
+                                      группах, где последнее изменение — наше
+                                      (подпись «…, пользователь Безуглов»)
   python grades_upload.py clear     — убрать оценки в РОДНОМ предмете для предметов,
                                       перенаправленных классовым правилом (см. ниже)
   python grades_upload.py dedupe    — убрать устаревшие дубли оценок резервного типа
@@ -45,6 +50,7 @@ import signal
 import sys
 import time
 from datetime import date as _date
+from datetime import datetime as _datetime, timedelta as _timedelta
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -1604,6 +1610,643 @@ def cmd_dedupe():
     return 0
 
 
+def _round_period_mark(avg, threshold=0.6, min_mark=2, max_mark=5):
+    """Средняя → итоговая: вверх, если дробная часть >= threshold (0.6).
+
+    4.40→4, 4.59→4, 4.60→5, 4.75→5, 3.67→4, 2.75→3, 5.00→5.
+    """
+    try:
+        val = round(float(avg), 2)
+    except Exception:
+        return None
+    if val <= 0:
+        return None
+    base = int(val)  # для положительных это floor
+    mark = base + 1 if (val - base) >= threshold - 1e-9 else base
+    return max(min_mark, min(max_mark, mark))
+
+
+def cmd_final():
+    """Итоговые отметки за период по средней оценке (Журнал → Итоговые отметки).
+
+    Для каждого класса/предмета педагога берёт средние из
+    `GET /webapi/grade/journal/average?sgId&termId`, считает итоговую
+    (вверх при дробной части >= `final_round_threshold`, по умолчанию 0.6)
+    и сохраняет через `POST /webapi/grade/journal/totals?sgId&termId`
+    (тот же вызов, что кнопка «Сохранить» на экране итоговых).
+
+    Опции: dry_run (по умолчанию true), final_terms (список названий периодов;
+    пусто — все уже начавшиеся), final_overwrite (перезаписывать существующие,
+    по умолчанию true), final_round_threshold (0.6), final_teacher (фильтр по
+    преподавателю, по умолчанию «Безуглов» — чужие группы не трогаются),
+    only_classes/only_subjects, preserve_classes (там существующие итоговые
+    не перезаписываются).
+    """
+    from playwright.sync_api import sync_playwright
+
+    cfg = load_options()
+    write = not bool(cfg.get("dry_run", True))
+    org = cfg.get("org") or ORG_KEY
+    only_classes = [jweb.norm_class(x) for x in (cfg.get("only_classes") or [])]
+    only_subjects = [jweb.norm_name(x) for x in (cfg.get("only_subjects") or [])]
+    preserve = {jweb.norm_class(x) for x in (cfg.get("preserve_classes") or [])}
+    threshold = float(cfg.get("final_round_threshold", 0.6))
+    teacher_need = (cfg.get("final_teacher") or "Безуглов").strip()
+    terms_want = {jweb.norm_name(x) for x in (cfg.get("final_terms") or [])}
+    overwrite = bool(cfg.get("final_overwrite", True))
+    today = _date.today().isoformat()
+    pause = float(cfg.get("pause", 0.4))
+
+    model, _src = load_model_any(cfg)
+    note("=" * 74)
+    note("Итоговые отметки по средней: %s" % ("ЗАПИСЬ" if write else "ПРОСМОТР (без изменений)"))
+    note("Правило: дробная часть >= %.2f → округление вверх; иначе вниз." % threshold)
+    note("Только предметные группы преподавателя: %s" % (teacher_need or "любого"))
+    if terms_want:
+        note("Периоды: %s" % ", ".join(sorted(terms_want)))
+    else:
+        note("Периоды: все уже начавшиеся (по датам АСУ РСО).")
+
+    stats = {"classes": 0, "groups": 0, "terms": 0, "students": 0,
+             "computed": 0, "changed": 0, "saved": 0, "kept": 0, "errors": 0}
+    report = {"mode": "write" if write else "plan", "threshold": threshold,
+              "items": [], "errors": []}
+
+    with sync_playwright() as pw:
+        ctx, page = a.launch(pw)
+        _CURRENT["page"] = page
+        net = a.NetLog(DISC_DIR / "network_final_run.log", capture_bodies=False)
+        net.attach(page)
+        a.capture_at(page)
+        try:
+            a.login(ctx, page, org_key=org)
+            if not goto_journal(page):
+                note("Не удалось открыть классный журнал.")
+                return 2
+            page.wait_for_timeout(2500)
+            a.find_at(page)
+
+            class_opts = []
+            for _ in range(20):
+                class_opts = _opts_one(page, "PCLID_IUP")
+                if class_opts:
+                    break
+                page.wait_for_timeout(700)
+            term_opts = _opts_one(page, "TERMID")
+            if not class_opts:
+                note("Не удалось получить список классов.")
+                return 2
+            note("Классов в фильтре: %d; периодов: %s" % (
+                len(class_opts), [o["t"] for o in term_opts]))
+
+            # уникальные классы из j-web (подгруппы «7А1/7А2» → базовый «7А»)
+            classes, seen = [], set()
+            for c in model["classes"]:
+                if only_classes and c["norm"] not in only_classes:
+                    continue
+                cop = _match_class_option(class_opts, c["name"])
+                if not cop:
+                    note("[%s] класс не найден в АСУ РСО" % c["name"])
+                    continue
+                if cop["v"] in seen:
+                    continue
+                seen.add(cop["v"])
+                classes.append((c, cop))
+
+            for c, cop in classes:
+                stats["classes"] += 1
+                select_by_label(page, "PCLID_IUP", value=cop["v"])
+                page.wait_for_timeout(2500)
+                a.dismiss_modals(page, where="final class %s" % c["name"])
+                sg_opts = []
+                for _ in range(20):
+                    sg_opts = _opts_one(page, "SGID")
+                    if len(sg_opts) > 1:
+                        break
+                    page.wait_for_timeout(500)
+                if not sg_opts:
+                    note("[%s] нет предметов" % c["name"])
+                    continue
+                is_preserve = _is_preserved(preserve, c["norm"])
+                if is_preserve:
+                    note("[%s] защищённый класс: существующие итоговые не перезаписываются"
+                         % c["name"])
+                # предметы с подгруппами: у них quickedit/totals валидируется по
+                # «последней открытой» группе (last-access), поэтому перед POST
+                # перевыбираем группу и перезагружаем сетку (как в run).
+                base_counts = {}
+                for o in sg_opts:
+                    if str(o.get("v")) in ("", "0", "-1", "null"):
+                        continue
+                    b = jweb.norm_name((o.get("t") or "").split("/")[0])
+                    base_counts[b] = base_counts.get(b, 0) + 1
+
+                for sop in sg_opts:
+                    if str(sop.get("v")) in ("", "0", "-1", "null"):
+                        continue
+                    if only_subjects and not any(
+                            x in jweb.norm_name(sop.get("t")) for x in only_subjects):
+                        continue
+                    sg_id = int(sop["v"])
+                    select_by_label(page, "SGID", value=sop["v"])
+                    page.wait_for_timeout(1800)
+                    a.dismiss_modals(page, where="final subject %s" % sop.get("t"))
+
+                    sginfo = a.api_get(page, "/webapi/subjectgroups/%d" % sg_id).get("body") or {}
+                    grading = sginfo.get("gradingSys")
+                    teachers = [(t.get("name") or "") for t in (sginfo.get("teachers") or [])]
+                    if teacher_need and not any(
+                            teacher_need.lower() in t.lower() for t in teachers):
+                        note("[%s / %s] преподаватель %s — пропуск (не %s)" % (
+                            c["name"], sop.get("t"),
+                            ", ".join(teachers) or "не указан", teacher_need))
+                        continue
+                    if grading and grading != "Mark":
+                        note("[%s / %s] система «%s» — итоговые по средней не ставятся"
+                             % (c["name"], sop.get("t"), grading))
+                        continue
+                    edit = a.api_get(
+                        page, "/webapi/grade/journal/totals/edit?iupClassId=%s&sgId=%d"
+                        % (cop["v"], sg_id)).get("body") or {}
+                    if edit and not edit.get("canEditTotals", True):
+                        note("[%s / %s] итоговые недоступны для редактирования"
+                             % (c["name"], sop.get("t")))
+                        continue
+
+                    stats["groups"] += 1
+                    t_opts = _opts_one(page, "TERMID") or term_opts
+                    for term in t_opts:
+                        tv = str(term.get("v"))
+                        if tv in ("", "0", "-1", "null"):
+                            continue
+                        if terms_want and jweb.norm_name(term.get("t")) not in terms_want:
+                            continue
+                        try:
+                            tid = int(tv)
+                        except Exception:
+                            continue
+                        tinfo = a.api_get(page, "/webapi/terms/%d" % tid).get("body") or {}
+                        start = str(tinfo.get("startDate") or "")[:10]
+                        if not terms_want and start and start > today:
+                            continue  # период ещё не начался
+                        avg = a.api_get(
+                            page, "/webapi/grade/journal/average?sgId=%d&termId=%d"
+                            % (sg_id, tid)).get("body") or []
+                        if not avg:
+                            note("  [%s / %s / %s] средних нет — пропуск" % (
+                                c["name"], sop.get("t")[:24], term.get("t")))
+                            continue
+                        totals = a.api_get(
+                            page, "/webapi/grade/journal/totals?sgId=%d&termId=%d"
+                            % (sg_id, tid)).get("body") or []
+                        existing = {}
+                        for t in totals:
+                            try:
+                                existing[int(t["studentId"])] = int(t.get("mark"))
+                            except Exception:
+                                pass
+
+                        payload, computed, changed, kept = {}, 0, 0, 0
+                        preview = []
+                        for row in avg:
+                            try:
+                                sid = int(row["studentId"])
+                            except Exception:
+                                continue
+                            cur = existing.get(sid)
+                            calc = _round_period_mark(row.get("avgMark"), threshold)
+                            if calc is None:
+                                if cur is not None:
+                                    payload[sid] = cur
+                                continue
+                            computed += 1
+                            if is_preserve and cur is not None:
+                                payload[sid] = cur
+                                kept += 1
+                            elif cur is not None and not overwrite:
+                                payload[sid] = cur
+                                kept += 1
+                            else:
+                                payload[sid] = calc
+                                if cur != calc:
+                                    changed += 1
+                            preview.append({"studentId": sid,
+                                            "avg": row.get("avgMark"),
+                                            "mark": payload[sid],
+                                            "was": cur})
+                        # ВАЖНО: в payload — только ученики ЭТОЙ группы (avg).
+                        # totals?sgId возвращает итоговые и второй подгруппы того
+                        # же предмета; если добавить их, сервер отвечает
+                        # 409 «Ошибка обращения к базе данных».
+
+                        item = {"class": c["name"], "group": sop.get("t"),
+                                "sgId": sg_id, "term": term.get("t"), "termId": tid,
+                                "students": len(avg), "computed": computed,
+                                "changed": changed, "kept": kept,
+                                "saved": 0, "status": "plan",
+                                "preview": preview}
+                        stats["terms"] += 1
+                        stats["students"] += len(avg)
+                        stats["computed"] += computed
+                        stats["changed"] += changed
+                        stats["kept"] += kept
+
+                        if not payload:
+                            note("  [%s / %s / %s] нет оценок для выставления" % (
+                                c["name"], sop.get("t")[:24], term.get("t")))
+                            item["status"] = "empty"
+                        elif changed == 0 and not is_preserve:
+                            note("  [%s / %s / %s] уже выставлено, изменений нет" % (
+                                c["name"], sop.get("t")[:24], term.get("t")))
+                            item["status"] = "unchanged"
+                        else:
+                            note("  [%s / %s / %s] учеников %d, рассчитано %d, "
+                                 "изменить %d%s" % (
+                                     c["name"], sop.get("t")[:24], term.get("t"),
+                                     len(avg), computed, changed,
+                                     (", сохранено чужих %d" % kept) if kept else ""))
+                            if write:
+                                body = [{"studentId": sid, "mark": payload[sid]}
+                                        for sid in sorted(payload)]
+                                sbase = jweb.norm_name((sop.get("t") or "").split("/")[0])
+                                need_refresh = base_counts.get(sbase, 0) > 1
+                                r = None
+                                navigated = False
+                                for attempt in range(3):
+                                    if attempt:
+                                        if not navigated:
+                                            # контекст экрана итоговых: без него
+                                            # подгруппы иногда дают 409 «Ошибка БД»
+                                            _spa_go(page, "/totals/edit/",
+                                                    {"sgId": sg_id, "termId": tid})
+                                            page.wait_for_timeout(3500)
+                                            a.dismiss_modals(
+                                                page, where="final edit %s" % sop.get("t"))
+                                            navigated = True
+                                    elif need_refresh:
+                                        select_by_label(page, "SGID", value=sop["v"])
+                                        _load_grid(page, net)
+                                        a.dismiss_modals(
+                                            page, where="before final post %s" % sop.get("t"))
+                                        page.wait_for_timeout(1500)
+                                    r = a.api_post(
+                                        page, "/webapi/grade/journal/totals?sgId=%d&termId=%d"
+                                        % (sg_id, tid), body)
+                                    if r.get("status") in (200, 204):
+                                        break
+                                    if r.get("status") != 409:
+                                        break
+                                    page.wait_for_timeout(1500)
+                                if navigated:
+                                    # вернуться в журнал и восстановить фильтры
+                                    _spa_go(page, "/", {})
+                                    page.wait_for_timeout(2500)
+                                    a.dismiss_modals(
+                                        page, where="final back %s" % sop.get("t"))
+                                    select_by_label(page, "PCLID_IUP", value=cop["v"])
+                                    page.wait_for_timeout(2000)
+                                    select_by_label(page, "TERMID", value=str(tid))
+                                    page.wait_for_timeout(700)
+                                if r.get("status") in (200, 204):
+                                    stats["saved"] += changed
+                                    item["saved"] = changed
+                                    item["status"] = "saved"
+                                    note("     → сохранено (%d учеников)" % len(body))
+                                else:
+                                    stats["errors"] += 1
+                                    item["status"] = "error"
+                                    item["error"] = "http %s %s" % (
+                                        r.get("status"),
+                                        json.dumps(r.get("body"), ensure_ascii=False)[:200])
+                                    note("     ! ошибка сохранения: %s %s" % (
+                                        r.get("status"),
+                                        json.dumps(r.get("body"), ensure_ascii=False)[:200]))
+                                    report["errors"].append(item)
+                        report["items"].append(item)
+                        if pause:
+                            page.wait_for_timeout(int(pause * 1000))
+        finally:
+            note("-" * 74)
+            note("Классов: %d, предметов: %d, периодов: %d; учеников: %d, "
+                 "рассчитано: %d, изменить: %d, сохранено: %d, "
+                 "сохранено существующих: %d, ошибок: %d" % (
+                     stats["classes"], stats["groups"], stats["terms"],
+                     stats["students"], stats["computed"], stats["changed"],
+                     stats["saved"], stats["kept"], stats["errors"]))
+            if not write:
+                note("Это был ПРОСМОТР — данные НЕ изменены.")
+            try:
+                report["stats"] = stats
+                (BASE / "final_report.json").write_text(
+                    json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+                note("Отчёт: final_report.json")
+            except Exception as exc:
+                note("final_report.json не сохранён: %r" % exc)
+            try:
+                a.logout(page)
+            except Exception:
+                pass
+            try:
+                ctx.close()
+            except Exception:
+                pass
+    return 0
+
+
+def _last_change_alert(page):
+    """Текст подписи «Последние изменения внесены …» (внизу журнала)."""
+    try:
+        return page.evaluate(
+            """() => [...document.querySelectorAll('.alert, [role=alert]')]
+                 .map(e => (e.innerText || '').replace(/\\s+/g, ' ').trim())
+                 .filter(s => s.indexOf('Последние изменения') >= 0)[0] || null""")
+    except Exception:
+        return None
+
+
+def _parse_last_change(text):
+    """'Последние изменения внесены 24.10.26 18:22, пользователь ФИО' → (dt, ФИО)."""
+    if not text:
+        return None, ""
+    t = re.sub(r"\s+", " ", str(text)).replace("\u00a0", " ")
+    u = re.search(r"пользователь\s+(.+?)\s*$", t)
+    user = u.group(1).strip() if u else ""
+    m = re.search(r"(\d{1,2}\.\d{1,2}\.\d{2,4})\s+(\d{1,2}:\d{2})", t)
+    if not m:
+        return None, user
+    ds, ts = m.group(1), m.group(2)
+    fmt = "%d.%m.%y %H:%M" if len(ds.split(".")[-1]) == 2 else "%d.%m.%Y %H:%M"
+    try:
+        return _datetime.strptime(ds + " " + ts, fmt), user
+    except Exception:
+        return None, user
+
+
+def _spa_go(page, path, search):
+    """Переход внутри Angular-приложения без перезагрузки страницы."""
+    try:
+        page.evaluate(
+            """([path, search]) => {
+              const el = document.querySelector('[ng-view]') || document.body;
+              const inj = angular.element(el).injector();
+              const loc = inj.get('$location');
+              const rs = inj.get('$rootScope');
+              rs.$apply(function () { loc.path(path).search(search); });
+            }""", [path, search])
+        return True
+    except Exception:
+        return False
+
+
+def cmd_final_cleanup():
+    """Убирает итоговые за период в ЧУЖИХ группах, где последнее изменение — наше.
+
+    Критерий — подпись внизу классного журнала «Последние изменения внесены
+    <дата время>, пользователь <ФИО>»: ФИО содержит `final_cleanup_user`
+    (по умолчанию «Безуглов»), а время не старше `final_cleanup_hours` (2 ч).
+    Список групп берётся из отчёта `final_other_teachers.json` (только записи
+    с `changed > 0`), поэтому группы, где мы ничего не меняли, не трогаются.
+
+    Очистка — `POST /webapi/grade/journal/totals?sgId&termId` с `mark: null`
+    для всех учеников выбранного периода (по умолчанию «1 четверть»).
+    По умолчанию `dry_run: true` — только отчёт `final_cleanup.json`.
+    """
+    from playwright.sync_api import sync_playwright
+
+    cfg = load_options()
+    write = not bool(cfg.get("dry_run", True))
+    org = cfg.get("org") or ORG_KEY
+    user_need = (cfg.get("final_cleanup_user") or "Безуглов").strip()
+    hours = float(cfg.get("final_cleanup_hours", 2))
+    term_want = cfg.get("final_cleanup_term") or "1 четверть"
+    teacher_need = (cfg.get("final_teacher") or "Безуглов").strip()
+    pause = float(cfg.get("pause", 0.4))
+    now = _datetime.now()
+    cutoff = now - _timedelta(hours=hours)
+    future = now + _timedelta(minutes=5)
+
+    rp = cfg.get("final_cleanup_report") or "grades_discovery/final_other_teachers.json"
+    report_path = Path(rp)
+    if not report_path.is_absolute():
+        report_path = BASE / report_path
+    if not report_path.exists():
+        note("Нет отчёта %s — нечего проверять." % report_path)
+        return 2
+    data = json.loads(report_path.read_text(encoding="utf-8"))
+    candidates, seen = [], set()
+    for x in data.get("other") or []:
+        if int(x.get("changed") or 0) <= 0:
+            continue
+        for sg in (x.get("sgIds") or []):
+            key = (jweb.norm_class(x.get("class")), int(sg))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({"class": x.get("class"), "subject": x.get("subject"),
+                               "sgId": int(sg), "changed": int(x.get("changed") or 0)})
+    note("=" * 74)
+    note("Очистка итоговых в чужих группах: %s" % ("ЗАПИСЬ" if write else "ПРОСМОТР"))
+    note("Подпись: «%s» за последние %.1f ч (с %s); период: %s" % (
+        user_need, hours, cutoff.strftime("%d.%m.%y %H:%M"), term_want))
+    note("Кандидатов из отчёта (changed > 0): %d" % len(candidates))
+
+    stats = {"checked": 0, "matched": 0, "cleared": 0, "skipped": 0, "errors": 0}
+    report = {"mode": "write" if write else "plan", "user": user_need,
+              "hours": hours, "term": term_want,
+              "cutoff": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+              "items": [], "stats": stats}
+
+    with sync_playwright() as pw:
+        ctx, page = a.launch(pw)
+        _CURRENT["page"] = page
+        net = a.NetLog(DISC_DIR / "network_final_cleanup.log", capture_bodies=False)
+        net.attach(page)
+        a.capture_at(page)
+        try:
+            a.login(ctx, page, org_key=org)
+            if not goto_journal(page):
+                note("Не удалось открыть классный журнал.")
+                return 2
+            page.wait_for_timeout(2000)
+            if not _opts_one(page, "PCLID_IUP"):
+                click_text_visible(page, "Классный журнал")
+                page.wait_for_timeout(4000)
+            a.find_at(page)
+            class_opts = _opts_one(page, "PCLID_IUP")
+            term_id = None
+            for t in _opts_one(page, "TERMID"):
+                if jweb.norm_name(t.get("t")) == jweb.norm_name(term_want):
+                    term_id = int(t["v"])
+                    break
+            if not term_id:
+                note("Период «%s» не найден." % term_want)
+                return 2
+
+            # группируем кандидатов по классу
+            by_class = {}
+            for cnd in candidates:
+                by_class.setdefault(jweb.norm_class(cnd["class"]), []).append(cnd)
+            need_reselect = False
+
+            for cnorm, group in by_class.items():
+                cop = _match_class_option(class_opts, group[0]["class"])
+                if not cop:
+                    note("[%s] класс не найден" % group[0]["class"])
+                    stats["skipped"] += len(group)
+                    continue
+                select_by_label(page, "PCLID_IUP", value=cop["v"])
+                page.wait_for_timeout(2200)
+                a.dismiss_modals(page, where="cleanup class %s" % group[0]["class"])
+                sg_opts = []
+                for _ in range(20):
+                    sg_opts = _opts_one(page, "SGID")
+                    if len(sg_opts) > 1:
+                        break
+                    page.wait_for_timeout(500)
+                by_sg = {str(o.get("v")): o for o in sg_opts}
+
+                for cnd in group:
+                    if need_reselect:
+                        select_by_label(page, "PCLID_IUP", value=cop["v"])
+                        page.wait_for_timeout(2000)
+                        need_reselect = False
+                    sg_id = cnd["sgId"]
+                    sop = by_sg.get(str(sg_id))
+                    if not sop:
+                        note("[%s / %s] группа %s не найдена" % (
+                            cnd["class"], cnd["subject"], sg_id))
+                        stats["skipped"] += 1
+                        continue
+                    sginfo = a.api_get(page, "/webapi/subjectgroups/%d" % sg_id).get("body") or {}
+                    teachers = [(t.get("name") or "") for t in (sginfo.get("teachers") or [])]
+                    if teacher_need and any(
+                            teacher_need.lower() in t.lower() for t in teachers):
+                        note("[%s / %s] преподаватель %s — своя группа, пропуск" % (
+                            cnd["class"], sop.get("t"), ", ".join(teachers)))
+                        stats["skipped"] += 1
+                        continue
+                    select_by_label(page, "SGID", value=sop["v"])
+                    page.wait_for_timeout(1200)
+                    select_by_label(page, "TERMID", value=str(term_id))
+                    page.wait_for_timeout(700)
+                    for btn in ("Загрузить", "Показать"):
+                        if click_text_visible(page, btn):
+                            break
+                    page.wait_for_timeout(3800)
+                    a.dismiss_modals(page, where="cleanup grid %s" % sop.get("t"))
+                    alert = _last_change_alert(page)
+                    ts, who = _parse_last_change(alert)
+                    item = {"class": cnd["class"], "group": sop.get("t"), "sgId": sg_id,
+                            "alert": alert, "user": who,
+                            "time": ts.strftime("%d.%m.%y %H:%M") if ts else None,
+                            "status": "checked", "totals": 0, "cleared": 0}
+                    stats["checked"] += 1
+                    matched = bool(ts and cutoff <= ts <= future
+                                   and user_need.lower() in who.lower())
+                    item["matched"] = matched
+                    if not matched:
+                        item["status"] = "not_ours"
+                        stats["skipped"] += 1
+                        note("[%s / %s] подпись: %s — пропуск" % (
+                            cnd["class"], sop.get("t"),
+                            (alert or "нет подписи")))
+                        report["items"].append(item)
+                        continue
+                    stats["matched"] += 1
+                    note("[%s / %s] подпись: %s — НАШЕ" % (
+                        cnd["class"], sop.get("t"), alert))
+                    totals = a.api_get(
+                        page, "/webapi/grade/journal/totals?sgId=%d&termId=%d"
+                        % (sg_id, term_id)).get("body") or []
+                    item["totals"] = len(totals)
+                    if not totals:
+                        item["status"] = "empty"
+                        note("     итоговых нет — уже пусто")
+                        report["items"].append(item)
+                        continue
+                    body, ids = [], set()
+                    for t in totals:
+                        try:
+                            sid = int(t["studentId"])
+                        except Exception:
+                            continue
+                        if sid in ids:
+                            continue
+                        ids.add(sid)
+                        body.append({"studentId": sid, "mark": None})
+                    if not write:
+                        item["status"] = "plan"
+                        note("     будет очищено: %d" % len(body))
+                        report["items"].append(item)
+                        continue
+                    r = a.api_post(
+                        page, "/webapi/grade/journal/totals?sgId=%d&termId=%d"
+                        % (sg_id, term_id), body)
+                    if r.get("status") == 409:
+                        # контекст экрана итоговых (как у кнопки «Сохранить»)
+                        _spa_go(page, "/totals/edit/", {"sgId": sg_id, "termId": term_id})
+                        page.wait_for_timeout(3500)
+                        a.dismiss_modals(page, where="cleanup edit %s" % sop.get("t"))
+                        r = a.api_post(
+                            page, "/webapi/grade/journal/totals?sgId=%d&termId=%d"
+                            % (sg_id, term_id), body)
+                        _spa_go(page, "/", {})
+                        page.wait_for_timeout(3000)
+                        a.dismiss_modals(page, where="cleanup back %s" % sop.get("t"))
+                        need_reselect = True
+                    if r.get("status") in (200, 204):
+                        left = a.api_get(
+                            page, "/webapi/grade/journal/totals?sgId=%d&termId=%d"
+                            % (sg_id, term_id)).get("body") or []
+                        left_marks = [t for t in left if t.get("mark") is not None]
+                        item["cleared"] = len(body) - len(left_marks)
+                        if left_marks:
+                            item["status"] = "partial"
+                            item["left"] = len(left_marks)
+                            stats["errors"] += 1
+                        else:
+                            item["status"] = "cleared"
+                            stats["cleared"] += len(body)
+                        note("     очищено: %d (осталось с оценками: %d)" % (
+                            item["cleared"], len(left_marks)))
+                    else:
+                        item["status"] = "error"
+                        item["error"] = "http %s %s" % (
+                            r.get("status"),
+                            json.dumps(r.get("body"), ensure_ascii=False)[:200])
+                        stats["errors"] += 1
+                        note("     ! ошибка очистки: %s %s" % (
+                            r.get("status"),
+                            json.dumps(r.get("body"), ensure_ascii=False)[:200]))
+                    report["items"].append(item)
+                    if pause:
+                        page.wait_for_timeout(int(pause * 1000))
+        finally:
+            note("-" * 74)
+            note("Проверено: %d, наших: %d, очищено оценок: %d, "
+                 "пропущено: %d, ошибок: %d" % (
+                     stats["checked"], stats["matched"], stats["cleared"],
+                     stats["skipped"], stats["errors"]))
+            if not write:
+                note("Это был ПРОСМОТР — данные НЕ изменены.")
+            report["stats"] = stats
+            try:
+                (BASE / "final_cleanup.json").write_text(
+                    json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+                note("Отчёт: final_cleanup.json")
+            except Exception as exc:
+                note("final_cleanup.json не сохранён: %r" % exc)
+            try:
+                a.logout(page)
+            except Exception:
+                pass
+            try:
+                ctx.close()
+            except Exception:
+                pass
+    return 0
+
+
 def _md(value):
     """Дата → (месяц, день): 'YYYY-MM-DD' или 'DD.MM' или None."""
     s = str(value or "").strip()
@@ -2226,6 +2869,10 @@ def main():
         return cmd_dedupe()
     if mode == "assign":
         return cmd_assign()
+    if mode == "final":
+        return cmd_final()
+    if mode == "final_cleanup":
+        return cmd_final_cleanup()
     print(__doc__)
     return 2
 
