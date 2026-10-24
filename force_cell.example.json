@@ -1,0 +1,14 @@
+{
+  "class": "7В",
+  "subject": "Информатика",
+  "student": "Волков Вадим",
+  "date": "2026-10-20",
+  "value": 5,
+  "work_type": "Сам/р",
+  "type_id": null,
+  "group": "",
+  "slot": null,
+  "tolerance_days": 3,
+  "create_if_missing": true,
+  "allow_new_column": false
+}

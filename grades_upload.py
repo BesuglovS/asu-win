@@ -28,6 +28,8 @@ students/classes. Приёмник: электронный классный жу
   python grades_upload.py final_cleanup — убрать итоговые за период в ЧУЖИХ
                                       группах, где последнее изменение — наше
                                       (подпись «…, пользователь Безуглов»)
+  python grades_upload.py force_cell — точечно обновить одну оценку (класс,
+                                      ученик, дата) по force_cell.json
   python grades_upload.py clear     — убрать оценки в РОДНОМ предмете для предметов,
                                       перенаправленных классовым правилом (см. ниже)
   python grades_upload.py dedupe    — убрать устаревшие дубли оценок резервного типа
@@ -69,6 +71,8 @@ OPTIONS_FILE = BASE / "options.json"
 PROGRESS_FILE = BASE / "progress.json"
 PLAN_FILE = BASE / "plan.json"
 SNAPSHOT_FILE = BASE / "jweb_snapshot.json"
+FORCE_FILE = BASE / "force_cell.json"
+FORCE_REPORT = BASE / "force_cell_report.json"
 DISC_DIR = BASE / "grades_discovery"
 LOG_FILE = BASE / "run.log"
 
@@ -2247,6 +2251,409 @@ def cmd_final_cleanup():
     return 0
 
 
+def _parse_spec_date(value):
+    """'YYYY-MM-DD', 'DD.MM.YYYY' или 'DD.MM' (текущий год) → date."""
+    s = str(value or "").strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", s)
+    if m:
+        return _date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})$", s)
+    if m:
+        return _date(_date.today().year, int(m.group(2)), int(m.group(1)))
+    return None
+
+
+def _find_cm_for_date(jr, target, tolerance, slot=None):
+    """Ближайшее занятие к дате (точное — приоритет). → (cm, diff) или (None, None)."""
+    cms = []
+    for cm in jr.get("classMeeting") or []:
+        d = str(cm.get("date") or "")[:10]
+        try:
+            dd = _date.fromisoformat(d)
+        except Exception:
+            continue
+        if slot is not None:
+            try:
+                if int(cm.get("scheduleTimeNum") or 0) != int(slot):
+                    continue
+            except Exception:
+                continue
+        cms.append((dd, cm))
+    for dd, cm in cms:
+        if dd == target:
+            return cm, 0
+    best, bestdiff = None, None
+    for dd, cm in cms:
+        diff = abs((dd - target).days)
+        if diff <= tolerance and (bestdiff is None or diff < bestdiff):
+            best, bestdiff = cm, diff
+    return best, bestdiff
+
+
+def cmd_force_cell():
+    """Точечно обновить ОДНУ оценку по force_cell.json (в обход preserve_classes).
+
+    Формат force_cell.json:
+      {
+        "class": "7В",                 // класс АСУ РСО (можно «7В»)
+        "subject": "Информатика",      // предмет АСУ РСО (или имя j-web — смапится)
+        "student": "Волков Вадим",     // ФИО ученика
+        "date": "2026-10-20",          // дата j-web или АСУ РСО
+        "value": 5,                    // новая оценка
+        "work_type": "Сам/р",          // необязательно: тип j-web/АСУ
+        "type_id": null,               // необязательно: id типа задания АСУ
+        "group": "Инф. гр.1",          // необязательно: подгруппа
+        "slot": null,                  // необязательно: номер урока в дне
+        "tolerance_days": 3,           // допуск по дате
+        "create_if_missing": true,     // создавать задание, если его нет
+        "allow_new_column": false      // разрешить новую колонку, если есть другая
+      }
+
+    Если `work_type`/`type_id` не заданы и у ученика в этой клетке ровно одна
+    оценка — тип берётся у неё. Обновляется только указанная клетка; остальные
+    оценки (в т.ч. других типов) не трогаются. По умолчанию `dry_run: true`.
+    """
+    from playwright.sync_api import sync_playwright
+
+    cfg = load_options()
+    write = not bool(cfg.get("dry_run", True))
+    if not FORCE_FILE.exists():
+        note("Нет %s. Создайте файл с параметрами точечного обновления." % FORCE_FILE)
+        return 2
+    try:
+        spec = json.loads(FORCE_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        note("force_cell.json не прочитан: %r" % exc)
+        return 2
+
+    cls = str(spec.get("class") or "").strip()
+    student = str(spec.get("student") or "").strip()
+    target = _parse_spec_date(spec.get("date"))
+    try:
+        value = int(spec.get("value"))
+    except Exception:
+        value = None
+    if not cls or not student or not target or value is None:
+        note("Нужны поля class, student, date, value.")
+        return 2
+    min_mark = int(spec.get("min_mark") or 2)
+    max_mark = int(spec.get("max_mark") or 5)
+    if not (min_mark <= value <= max_mark):
+        note("Оценка %s вне диапазона %d..%d." % (value, min_mark, max_mark))
+        return 2
+
+    subject = str(spec.get("subject") or "").strip()
+    group_want = str(spec.get("group") or "").strip()
+    work_type = str(spec.get("work_type") or "").strip()
+    type_id = spec.get("type_id")
+    try:
+        tolerance = int(spec.get("tolerance_days")
+                        if spec.get("tolerance_days") is not None
+                        else (cfg.get("date_tolerance_days") or 0))
+    except Exception:
+        tolerance = 0
+    slot = spec.get("slot")
+    create_if_missing = bool(spec.get("create_if_missing", True))
+    allow_new_column = bool(spec.get("allow_new_column", False))
+    org = cfg.get("org") or ORG_KEY
+    class_norm = jweb.norm_class(cls)
+    _cbase, cdigit = _class_base_digit(class_norm)
+
+    note("=" * 74)
+    note("Точечное обновление: %s" % ("ЗАПИСЬ" if write else "ПРОСМОТР (без изменений)"))
+    note("Класс: %s | ученик: %s | дата: %s | оценка: %s" % (
+        cls, student, target.isoformat(), value))
+
+    report = {"mode": "write" if write else "plan", "spec": spec,
+              "status": "not_found", "target": None, "error": None}
+
+    with sync_playwright() as pw:
+        ctx, page = a.launch(pw)
+        _CURRENT["page"] = page
+        net = a.NetLog(DISC_DIR / "network_force_cell.log", capture_bodies=False)
+        net.attach(page)
+        a.capture_at(page)
+        try:
+            a.login(ctx, page, org_key=org)
+            if not goto_journal(page):
+                note("Не удалось открыть классный журнал.")
+                return 2
+            page.wait_for_timeout(2500)
+            if not _opts_one(page, "PCLID_IUP"):
+                click_text_visible(page, "Классный журнал")
+                page.wait_for_timeout(4000)
+            a.find_at(page)
+
+            class_opts = _opts_one(page, "PCLID_IUP")
+            cop = _match_class_option(class_opts, cls)
+            if not cop:
+                note("Класс %s не найден." % cls)
+                return 2
+            select_by_label(page, "PCLID_IUP", value=cop["v"])
+            page.wait_for_timeout(2500)
+            a.dismiss_modals(page, where="force class %s" % cls)
+            sg_opts = []
+            for _ in range(20):
+                sg_opts = _opts_one(page, "SGID")
+                if len(sg_opts) > 1:
+                    break
+                page.wait_for_timeout(500)
+
+            if subject:
+                subject = _target_subject(cfg, class_norm, subject)
+                sops = _match_subject_options(sg_opts, subject, cdigit)
+            else:
+                sops = list(sg_opts)
+            if group_want:
+                gw = jweb.norm_name(group_want)
+                sops = [o for o in sops if gw in jweb.norm_name(o.get("t"))]
+            sops = [o for o in sops if str(o.get("v")) not in ("", "0", "-1", "null")]
+            if not sops:
+                note("Предмет/подгруппа не найдены. Доступно: %s" % (
+                    [o.get("t") for o in sg_opts]))
+                return 2
+
+            types = a.api_get(page, "/webapi/grade/assignment/types?all=False").get("body") or []
+            aid, type_name = None, ""
+            if type_id not in (None, ""):
+                try:
+                    aid = int(type_id)
+                except Exception:
+                    aid = None
+                type_name = next((t.get("name") or "" for t in types
+                                  if int(t.get("id") or 0) == aid), str(type_id))
+            elif work_type:
+                wt2id, _by_norm = _type_map(types, cfg, [work_type])
+                aid = wt2id.get(work_type)
+                type_name = work_type
+                if not aid:
+                    note("Тип работы «%s» не распознан. Доступные типы: %s" % (
+                        work_type, [t.get("name") for t in types if t.get("isActive", True)]))
+                    return 2
+            term_opts = _opts_one(page, "TERMID")
+
+            matches = []
+            for sop in sops:
+                select_by_label(page, "SGID", value=sop["v"])
+                page.wait_for_timeout(1800)
+                a.dismiss_modals(page, where="force subject %s" % sop.get("t"))
+                sginfo = a.api_get(page, "/webapi/subjectgroups/%s"
+                                   % sop["v"]).get("body") or {}
+                teachers = [(t.get("name") or "") for t in (sginfo.get("teachers") or [])]
+                if teachers:
+                    note("  группа %s: преподаватель %s" % (
+                        sop.get("t"), ", ".join(teachers)))
+                for term in term_opts:
+                    tv = str(term.get("v"))
+                    if tv in ("", "0", "-1", "null"):
+                        continue
+                    select_by_label(page, "TERMID", value=tv)
+                    page.wait_for_timeout(700)
+                    jr, _url = _load_grid(page, net)
+                    if not jr:
+                        continue
+                    cm, diff = _find_cm_for_date(jr, target, tolerance, slot)
+                    if not cm:
+                        continue
+                    sid = _student_match(jr.get("students") or [], student)
+                    if not sid:
+                        continue
+                    a_by_id = {int(x["id"]): x for x in (jr.get("assignments") or [])
+                               if x.get("id") is not None}
+                    marks = []
+                    for m in jr.get("marks") or []:
+                        if int(m.get("studentId") or 0) != int(sid):
+                            continue
+                        x = a_by_id.get(int(m.get("assignmentId") or 0))
+                        if not x or int(x.get("classMeetingId") or 0) != int(cm["id"]):
+                            continue
+                        if m.get("mark") in (None, ""):
+                            continue
+                        marks.append((int(x["typeId"]), int(x["id"]), int(m["mark"])))
+                    matches.append({
+                        "sop": sop, "term": term, "jr": jr, "cm": cm, "diff": diff,
+                        "sid": int(sid), "marks": marks, "teachers": teachers,
+                        "sgId": int(jr.get("subjectGroupId") or sop["v"]),
+                        "classId": int(jr.get("classId") or 0),
+                        "grade": int(jr.get("grade") or 0),
+                    })
+                    if len(matches) > 1:
+                        break
+                if len(matches) > 1:
+                    break
+
+            if not matches:
+                note("Не найдено занятие/ученик в пределах ±%d дн. от %s." % (
+                    tolerance, target.isoformat()))
+                report["error"] = "not_found"
+                return 2
+
+            # одна клетка; если подходящих несколько — нужен group/slot
+            uniq = {}
+            for m in matches:
+                key = (m["sgId"], int(m["cm"]["id"]), m["sid"])
+                uniq.setdefault(key, m)
+            matches = list(uniq.values())
+            if len(matches) > 1:
+                note("Найдено несколько вариантов — уточните group/slot:")
+                for m in matches:
+                    note("  %s / %s / %s" % (m["sop"].get("t"), m["term"].get("t"),
+                                             str(m["cm"].get("date"))[:10]))
+                return 2
+            hit = matches[0]
+            jr, cm, sid, marks = hit["jr"], hit["cm"], hit["sid"], hit["marks"]
+            asu_date = str(cm.get("date") or "")[:10]
+            if hit["diff"]:
+                note("Дата сопоставлена: %s → %s (±%d дн.)" % (
+                    target.isoformat(), asu_date, hit["diff"]))
+            else:
+                note("Дата: %s" % asu_date)
+
+            if aid is None:
+                if len(marks) == 1:
+                    aid = marks[0][0]
+                    type_name = next((t.get("name") or "" for t in types
+                                      if int(t.get("id") or 0) == aid), str(aid))
+                    note("Тип не задан — беру существующий: %s (id %s)" % (
+                        type_name, aid))
+                elif not marks:
+                    note("В клетке нет оценки — укажите work_type или type_id.")
+                    report["error"] = "no_type"
+                    return 2
+                else:
+                    note("В клетке несколько оценок — укажите work_type/type_id: %s" % (
+                        [m[0] for m in marks]))
+                    report["error"] = "ambiguous_type"
+                    return 2
+
+            asg = None
+            for x in jr.get("assignments") or []:
+                try:
+                    if (int(x.get("classMeetingId") or 0) == int(cm["id"])
+                            and int(x.get("typeId") or 0) == int(aid)):
+                        asg = x
+                        break
+                except Exception:
+                    pass
+            existing = next((v for (t, _a, v) in marks if int(t) == int(aid)), None)
+            others = [(t, v) for (t, _a, v) in marks if int(t) != int(aid)]
+
+            if asg is None and others and not allow_new_column:
+                note("У ученика в этой клетке уже есть оценки других типов %s." % (
+                    others))
+                note("Чтобы добавить новую колонку, поставьте allow_new_column: true "
+                     "или укажите правильный work_type/type_id.")
+                report["error"] = "other_column"
+                return 2
+            if asg is None and not create_if_missing:
+                note("Задания типа «%s» нет, create_if_missing: false." % type_name)
+                report["error"] = "no_assignment"
+                return 2
+
+            if not type_name:
+                type_name = next((t.get("name") or "" for t in types
+                                  if int(t.get("id") or 0) == int(aid)), str(aid))
+            hit_info = {
+                "class": cop.get("t"), "group": hit["sop"].get("t"),
+                "sgId": hit["sgId"], "term": hit["term"].get("t"),
+                "termId": int(hit["term"]["v"]), "student": student,
+                "studentId": sid, "date_jweb": target.isoformat(),
+                "date_asu": asu_date, "diff_days": hit["diff"] or 0,
+                "typeId": int(aid), "typeName": type_name,
+                "assignId": int(asg["id"]) if asg else None,
+                "was": existing, "new": value,
+                "other_marks": others, "teachers": hit["teachers"],
+            }
+            report["target"] = hit_info
+            note("  %s / %s / %s" % (hit_info["class"], hit_info["group"],
+                                     hit_info["term"]))
+            note("  ученик %s (id %s), тип «%s» (id %s), было: %s → станет: %s" % (
+                student, sid, type_name, aid,
+                existing if existing is not None else "—", value))
+            if existing == value:
+                note("  значение уже совпадает — менять нечего.")
+                report["status"] = "noop"
+                return 0
+
+            if not write:
+                note("Это был ПРОСМОТР — данные НЕ изменены.")
+                report["status"] = "plan"
+                return 0
+
+            # перед записью обновляем «последнюю открытую» группу
+            select_by_label(page, "SGID", value=str(hit["sop"]["v"]))
+            page.wait_for_timeout(700)
+            select_by_label(page, "TERMID", value=str(hit["term"]["v"]))
+            page.wait_for_timeout(500)
+            _load_grid(page, net)
+            a.dismiss_modals(page, where="force before post")
+
+            entry = {"cmId": int(cm["id"]), "assignTypeId": int(aid),
+                     "studentId": int(sid), "mark": int(value), "dutyMark": 0}
+            if asg:
+                entry["assignId"] = int(asg["id"])
+            payload = {"sgId": int(hit["sgId"]), "classId": int(hit["classId"]),
+                       "grade": int(hit["grade"]),
+                       "results": [entry], "attendance": []}
+            r = a.api_post(page, "/webapi/grade/journal/quickedit", payload)
+            if r.get("status") == 409:
+                page.wait_for_timeout(1200)
+                select_by_label(page, "SGID", value=str(hit["sop"]["v"]))
+                _load_grid(page, net)
+                a.dismiss_modals(page, where="force retry post")
+                r = a.api_post(page, "/webapi/grade/journal/quickedit", payload)
+            if r.get("status") not in (200, 204):
+                report["status"] = "error"
+                report["error"] = "http %s %s" % (
+                    r.get("status"), json.dumps(r.get("body"), ensure_ascii=False)[:300])
+                note("  ! ошибка сохранения: %s %s" % (
+                    r.get("status"),
+                    json.dumps(r.get("body"), ensure_ascii=False)[:300]))
+                return 2
+            note("  → сохранено (quickedit %s)" % r.get("status"))
+
+            # контрольное чтение
+            jr2, _u = _load_grid(page, net)
+            now = None
+            if jr2:
+                a2 = {int(x["id"]): x for x in (jr2.get("assignments") or [])
+                      if x.get("id") is not None}
+                for m in jr2.get("marks") or []:
+                    x = a2.get(int(m.get("assignmentId") or 0))
+                    if (x and int(x.get("classMeetingId") or 0) == int(cm["id"])
+                            and int(x.get("typeId") or 0) == int(aid)
+                            and int(m.get("studentId") or 0) == int(sid)):
+                        now = int(m["mark"]) if m.get("mark") not in (None, "") else None
+            hit_info["now"] = now
+            if now == value:
+                report["status"] = "updated"
+                note("  проверка: на сайте %s" % now)
+            else:
+                report["status"] = "verify_failed"
+                report["error"] = "now=%s" % now
+                note("  ! проверка: на сайте %s (ожидалось %s)" % (now, value))
+            return 0
+        finally:
+            try:
+                (FORCE_REPORT).write_text(
+                    json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+                note("Отчёт: %s" % FORCE_REPORT.name)
+            except Exception as exc:
+                note("force_cell_report.json не сохранён: %r" % exc)
+            try:
+                a.logout(page)
+            except Exception:
+                pass
+            try:
+                ctx.close()
+            except Exception:
+                pass
+    return 0
+
+
 def _md(value):
     """Дата → (месяц, день): 'YYYY-MM-DD' или 'DD.MM' или None."""
     s = str(value or "").strip()
@@ -2873,6 +3280,8 @@ def main():
         return cmd_final()
     if mode == "final_cleanup":
         return cmd_final_cleanup()
+    if mode == "force_cell":
+        return cmd_force_cell()
     print(__doc__)
     return 2
 

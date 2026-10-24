@@ -10,6 +10,8 @@ plan.json
 verify.txt
 final_report.json
 final_cleanup.json
+force_cell.json
+force_cell_report.json
 jweb_snapshot.json
 run.log
 modals.log
