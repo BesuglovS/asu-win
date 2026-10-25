@@ -686,6 +686,44 @@ def _resolve_type(label, by_norm):
     return None
 
 
+def _subject_wt_map(cfg, subject_name, wt2id, by_norm):
+    """work_type → typeId с учётом метки по предмету j-web.
+
+    options.subject_work_type_map = {"Труд (технология)": {"*": "Практическая работа"}}
+    — все оценки этого предмета j-web пишутся типом задания «Практическая
+    работа», т.е. в СВОЮ колонку журнала. Нужно, когда два предмета j-web
+    направлены в один предмет АСУ РСО (class_grade_subject) и их оценки одного
+    типа (`work_type`) иначе попали бы в одну клетку (занятие × ученик × тип) и
+    затирали друг друга. Ключ `*` — для всех типов работ предмета; конкретный
+    work_type важнее `*`. Возвращает новый словарь, исходный не меняется.
+    """
+    table = cfg.get("subject_work_type_map") or {}
+    if not table or not subject_name:
+        return wt2id
+    key = subject_name if subject_name in table else None
+    if key is None:
+        nn = jweb.norm_name(subject_name)
+        for k in table:
+            if jweb.norm_name(k) == nn:
+                key = k
+                break
+    if key is None:
+        return wt2id
+    mapping = table.get(key) or {}
+    out = dict(wt2id)
+    star = _resolve_type(mapping.get("*"), by_norm) if mapping.get("*") else None
+    if star:
+        for wt in list(out):
+            out[wt] = star
+    for wt, label in mapping.items():
+        if wt == "*":
+            continue
+        tid = _resolve_type(label, by_norm)
+        if tid:
+            out[wt] = tid
+    return out
+
+
 def _is_homework_conflict(resp):
     """409 «На выбранный Вами урок уже назначено Домашнее задание».
 
@@ -1039,7 +1077,9 @@ def cmd_verify():
                                     site[(int(x["classMeetingId"]), int(m["studentId"]),
                                           int(x["typeId"]))] = int(m["mark"])
                             misses = {}
-                            part, mtd = _build_results(jr, {"lessons": s["lessons"]}, wt2id, misses, tol_days)
+                            part, mtd = _build_results(jr, {"lessons": s["lessons"]},
+                                                       _subject_wt_map(cfg, s["name"], wt2id, by_norm),
+                                                       misses, tol_days)
                             matched |= mtd
                             for r in part:
                                 desired[(r["cmId"], r["studentId"], r["assignTypeId"])] = r["mark"]
@@ -1201,6 +1241,8 @@ def cmd_clear():
                             if not jr:
                                 continue
                             site = _site_marks(jr)
+                            # родной предмет чистим по БАЗОВОЙ карте типов: старые
+                            # оценки там выставлены до появления subject_work_type_map
                             wants, _mtd = _build_results(
                                 jr, {"lessons": s["lessons"]}, wt2id, {}, tol_days,
                                 clear_marks=True)
@@ -1416,7 +1458,8 @@ def cmd_dedupe():
                             continue
                         sgid = int(jr["subjectGroupId"])
                         part, _mtd = _build_results(
-                            jr, {"lessons": s["lessons"]}, wt2id, {}, tol_days)
+                            jr, {"lessons": s["lessons"]},
+                            _subject_wt_map(cfg, s["name"], wt2id, by_norm), {}, tol_days)
                         for r in part:
                             key = (sgid, int(r["cmId"]), int(r["studentId"]),
                                    int(r["assignTypeId"]))
@@ -1656,6 +1699,7 @@ def cmd_final():
     preserve = {jweb.norm_class(x) for x in (cfg.get("preserve_classes") or [])}
     threshold = float(cfg.get("final_round_threshold", 0.6))
     teacher_need = (cfg.get("final_teacher") or "Безуглов").strip()
+    skip_classes = {jweb.norm_class(x) for x in (cfg.get("final_skip_classes") or [])}
     terms_want = {jweb.norm_name(x) for x in (cfg.get("final_terms") or [])}
     overwrite = bool(cfg.get("final_overwrite", True))
     today = _date.today().isoformat()
@@ -1666,6 +1710,9 @@ def cmd_final():
     note("Итоговые отметки по средней: %s" % ("ЗАПИСЬ" if write else "ПРОСМОТР (без изменений)"))
     note("Правило: дробная часть >= %.2f → округление вверх; иначе вниз." % threshold)
     note("Только предметные группы преподавателя: %s" % (teacher_need or "любого"))
+    if skip_classes:
+        note("Классы, где итоговые не выставляются (другой преподаватель): %s"
+             % ", ".join(sorted(skip_classes)))
     if terms_want:
         note("Периоды: %s" % ", ".join(sorted(terms_want)))
     else:
@@ -1718,6 +1765,10 @@ def cmd_final():
                 classes.append((c, cop))
 
             for c, cop in classes:
+                if _is_preserved(skip_classes, c["norm"]):
+                    note("[%s] пропуск: итоговые выставляет другой преподаватель "
+                         "(final_skip_classes)" % c["name"])
+                    continue
                 stats["classes"] += 1
                 select_by_label(page, "PCLID_IUP", value=cop["v"])
                 page.wait_for_timeout(2500)
@@ -3101,7 +3152,8 @@ def cmd_plan_or_run(mode):
                             if jr_id is None:
                                 jr_id = {"sgId": jr.get("subjectGroupId"), "classId": jr.get("classId"),
                                          "grade": jr.get("grade")}
-                            part, mtd = _build_results(jr, {"lessons": lessons_all}, wt2id,
+                            part, mtd = _build_results(jr, {"lessons": lessons_all},
+                                                       _subject_wt_map(cfg, s["name"], wt2id, by_norm),
                                                        misses, tol_days, protect_types=protect)
                             results.extend(part)
                             matched |= mtd
